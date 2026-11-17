@@ -267,6 +267,7 @@
     currentEl = el;
 
     $('#app').classList.toggle('dark-top', !!out.dark);
+    $('#app').classList.toggle('light-top', !out.dark && PUBLIC_SCREENS.has(top.name));
     setNav(showNav ? top.name : null, showNav);
     U.refreshIcons();
     if (out.mount) cleanup = out.mount(el) || null;
