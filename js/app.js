@@ -72,7 +72,7 @@
     seed() {
       const now = Date.now();
       return {
-        version: 2,
+        version: 3,
         /* Prototype-only account list kept in this browser (mock auth, never sent anywhere). */
         accounts: D.DEMO_ACCOUNTS.map((a) => ({ ...a })),
         users: {
@@ -84,7 +84,7 @@
           postedAt: now - t.minutesAgo * 60000,
           runner: t.runner || null,
           step: t.step ?? (t.status === 'completed' ? 5 : 0),
-          fee: U.fee(t.reward),
+          fee: feeModel(t.reward).fee,
           image: null,
         })),
         chats: {},
@@ -95,7 +95,7 @@
         const raw = localStorage.getItem(KEY);
         this.state = raw ? JSON.parse(raw) : null;
       } catch (e) { this.state = null; }
-      if (!this.state || this.state.version !== 2) this.state = this.seed();
+      if (!this.state || this.state.version !== 3) this.state = this.seed();
       try { this.session = sessionStorage.getItem(SESSION_KEY); } catch (e) { this.session = null; }
       if (this.session && !this.state.users[this.session]) this.setSession(null);
       this.save();
@@ -104,7 +104,7 @@
     reload(raw) {
       try {
         const st = JSON.parse(raw ?? localStorage.getItem(KEY));
-        if (!st || st.version !== 2) return false;
+        if (!st || st.version !== 3) return false;
         const mine = this.state?.users?.[this.session];
         if (mine && st.users[this.session]) st.users[this.session].draft = mine.draft;
         this.state = st;
@@ -146,11 +146,121 @@
   const unread = () => S().notifications.filter((n) => !n.read).length;
   /* Item budget held in escrow for Buy & Bring (sample users' tasks count their stated budget). */
   const itemHeld = (t) => (t.type === 'buy' ? (t.itemEscrow ?? (isAccount(t.requester) ? 0 : (t.budget || 0))) : 0);
-  const total = (t) => t.reward + (t.fee ?? U.fee(t.reward)) + itemHeld(t);
+  /* Money model (TAASKAR payment-flow sheet):
+     - Sender pays item price (Buy & Bring budget) + runner reward + a refundable security deposit.
+     - Runner adds a refundable security stake when accepting.
+     - Platform fee F = 10% of reward (min ₹5): (F - share) from the sender's deposit, share (20%) from the runner's stake.
+     - Deposit = 2 × F, stake = F.  Example ₹5 reward → F ₹5 = ₹4 + ₹1, deposit ₹10, stake ₹5. */
+  function feeModel(reward) {
+    const fee = Math.max(5, Math.round((+reward || 0) * 0.1));
+    const feeRunner = Math.max(1, Math.round(fee * 0.2));
+    return { fee, feeUser: fee - feeRunner, feeRunner, deposit: fee * 2, stake: fee };
+  }
+  const M = (t) => t.fees || feeModel(t.reward);
+  const stakeOf = (t) => (t.runner ? (t.stakePaid ?? M(t).stake) : 0);
+  /* What the sender paid into escrow. */
+  const total = (t) => itemHeld(t) + t.reward + M(t).deposit;
   const draftTotals = (d) => {
-    const reward = +d.reward || 0, fee = U.fee(reward), budget = d.type === 'buy' ? (+d.budget || 0) : 0;
-    return { reward, fee, budget, tot: reward + fee + budget };
+    const reward = +d.reward || 0, m = feeModel(reward), budget = d.type === 'buy' ? (+d.budget || 0) : 0;
+    return { reward, budget, ...m, tot: budget + reward + m.deposit };
   };
+
+  /* Who gets what when a task ends. */
+  function computeSettlement(t, outcome) {
+    const m = M(t), R = t.reward, held = itemHeld(t), stake = stakeOf(t);
+    const bought = t.purchase && t.purchase.status === 'ok';
+    const join = (a) => a.filter(Boolean).join(' + ');
+    let cost = 0, runner = 0, user = 0, platform = 0, rl = '', ul = '', pl = '';
+    if (outcome === 'completed') {
+      cost = held ? Math.min(held, t.purchase?.amount ?? held) : 0;
+      runner = cost + R + (stake - m.feeRunner);
+      user = (m.deposit - m.feeUser) + (held - cost);
+      platform = m.feeUser + m.feeRunner;
+      rl = join([cost && `${money(cost)} item`, `${money(R)} reward`, `${money(stake - m.feeRunner)} stake back`]);
+      ul = join([`${money(m.deposit - m.feeUser)} of ${money(m.deposit)} deposit`, held - cost > 0 && `${money(held - cost)} unused budget`]);
+      pl = `${money(m.feeUser)} from deposit + ${money(m.feeRunner)} from stake`;
+    } else if (outcome === 'runner_cancelled') {
+      user = held + R + m.deposit;
+      platform = stake;
+      rl = 'Security stake forfeited';
+      ul = join([held && `${money(held)} item`, `${money(R)} reward`, `${money(m.deposit)} deposit`]);
+      pl = `${money(stake)} from runner stake`;
+    } else if (outcome === 'user_cancelled') {
+      cost = held && bought ? Math.min(held, t.purchase.amount) : 0;
+      runner = cost + stake;
+      user = (m.deposit - m.fee) + R + (held - cost);
+      platform = m.fee;
+      rl = join([cost && `${money(cost)} item`, `${money(stake)} stake back`]);
+      ul = join([`${money(m.deposit - m.fee)} deposit`, `${money(R)} reward`, held - cost > 0 && `${money(held - cost)} item budget`]);
+      pl = `${money(m.fee)} from sender deposit`;
+    } else {
+      user = held + R + m.deposit;
+      rl = 'No runner yet';
+      ul = 'Full refund';
+      pl = 'No fee';
+    }
+    return { outcome, cost, runner, user, platform, lines: { runner: rl, user: ul, platform: pl } };
+  }
+
+  /* Move the money: credit demo accounts in this browser and record the result on the task. */
+  function applySettlement(t, outcome) {
+    const st = computeSettlement(t, outcome);
+    t.settlement = { ...st, at: Date.now() };
+    const m = M(t);
+    const ru = Store.state.users[t.runner];
+    if (ru) {
+      ru.wallet.pending = Math.max(0, ru.wallet.pending - t.reward);
+      ru.wallet.available += st.runner;
+      if (outcome === 'completed') {
+        ru.wallet.earnings += t.reward;
+        ru.user.completed = (ru.user.completed ?? 0) + 1;
+        ru.user.tasks = (ru.user.tasks ?? 0) + 1;
+      }
+      if (st.cost) addTxnFor(t.runner, { kind: 'reimburse', title: 'Item cost reimbursed', note: t.title, amount: st.cost });
+      if (outcome === 'completed') {
+        addTxnFor(t.runner, { kind: 'reward', title: 'Task reward', note: t.title, amount: t.reward });
+        addTxnFor(t.runner, { kind: 'stake_return', title: 'Stake returned', note: `${t.title} · ${money(m.feeRunner)} platform fee`, amount: stakeOf(t) - m.feeRunner });
+      }
+      if (outcome === 'user_cancelled') addTxnFor(t.runner, { kind: 'stake_return', title: 'Stake returned', note: `${t.title} · cancelled by sender`, amount: stakeOf(t) });
+    }
+    const rq = Store.state.users[t.requester];
+    if (rq && st.user > 0) {
+      rq.wallet.available += st.user;
+      rq.wallet.spending = Math.max(0, rq.wallet.spending - st.user);
+      addTxnFor(t.requester, { kind: 'refund', title: outcome === 'completed' ? 'Deposit refund' : 'Refund', note: `${t.title} · ${st.lines.user}`, amount: st.user });
+    }
+    return st;
+  }
+
+  const SETTLE_TITLE = { completed: 'Settlement', runner_cancelled: 'Settlement · cancelled by runner', user_cancelled: 'Settlement · cancelled by sender', cancelled_open: 'Refund' };
+  function settlementCard(t) {
+    const st = t.settlement;
+    if (!st) return '';
+    const row = (label, amount, line, cls = '') => `<div class="settle-row"><div><span>${label}</span><small>${esc(line)}</small></div><b class="${cls}">${money(amount)}</b></div>`;
+    return `<div class="card card-pad" style="margin-top:12px">
+      <div class="card-title">${icon(st.outcome === 'completed' ? 'circle-check' : 'circle-x', 'i-18 ' + (st.outcome === 'completed' ? 'text-green' : 'text-danger'))}${SETTLE_TITLE[st.outcome]}</div>
+      ${row('Runner receives', st.runner, st.lines.runner)}
+      ${row('Sender refund', st.user, st.lines.user, 'text-green')}
+      ${row('TAASKAR fee', st.platform, st.lines.platform)}
+    </div>`;
+  }
+
+  /* Escrow summary while a task is active. */
+  function escrowCard(t, { iRun = false, done = false } = {}) {
+    if (t.settlement) return settlementCard(t);
+    const m = M(t), held = itemHeld(t), stake = stakeOf(t), bill = t.purchase;
+    const parts = [held && `Item ${money(held)}`, `Reward ${money(t.reward)}`, `Deposit ${money(m.deposit)}`].filter(Boolean).join(' · ');
+    return `<div class="card card-pad" style="margin-top:12px">
+      <div class="card-title">${icon('lock', 'i-18 text-navy')}Held in escrow</div>
+      <div class="settle-row"><div><span>Sender paid</span><small>${parts}</small></div><b>${money(total(t))}</b></div>
+      ${t.runner ? `<div class="settle-row"><div><span>Runner stake</span><small>Refundable</small></div><b>${money(stake)}</b></div>` : ''}
+      <div class="kv total"><span>Total held</span><b>${money(total(t) + stake)}</b></div>
+      ${held ? (bill ? `<div class="divider"></div>
+        <div class="kv"><span>Bill amount</span><b>${money(bill.amount)}${bill.photo ? ` <button class="edit-link" data-action="view-bill">View bill</button>` : ''}</b></div>
+        ${bill.status === 'pending' ? `<div class="kv"><span>Status</span><b style="color:var(--warn-dk)">Awaiting approval</b></div>` : ''}`
+        : (t.runner ? `<div class="hint">${iRun ? 'Add the bill when you buy the items.' : 'The runner adds the bill after buying.'}</div>` : '')) : ''}
+    </div>`;
+  }
 
   function notify(n) { S().notifications.unshift({ id: uid('n'), at: Date.now(), read: false, ...n }); }
   function addTxn(x) { S().transactions.unshift({ id: uid('x'), at: Date.now(), ...x }); }
@@ -1051,7 +1161,7 @@
         ${d.type === 'buy' ? `<div class="field" data-f="budget"><label class="label" for="cf-budget">Maximum item budget</label>
           <div class="prefix-input"><span class="prefix">₹</span><input id="cf-budget" class="input" data-bind="budget" inputmode="numeric" value="${esc(d.budget)}" placeholder="e.g. 1200"></div>
           <div class="error-text"></div>
-          <div class="hint">Held in escrow with the reward. The runner is paid the bill amount and the rest comes back to you.</div></div>` : ''}
+          <div class="hint">Held in escrow. The runner is paid the bill amount and the rest comes back to you.</div></div>` : ''}
         <div class="field"><span class="label">Photo <span class="opt">(optional)</span></span>
           ${d.image ? `<div class="upload-preview"><img src="${d.image}" alt="Task photo"><button class="icon-btn" data-action="remove-image" aria-label="Remove photo">${icon('x', 'i-18')}</button></div>`
           : `<label class="upload" for="cf-file"><div class="icon-tile sm">${icon('image-plus', 'i-18')}</div><div><b style="font-size:14px">Add a photo</b><div class="meta">Helps the runner identify the item</div></div></label>`}
@@ -1088,7 +1198,6 @@
         <div style="margin-top:14px">${U.escrowNote()}</div>`;
     }
     /* Step 5 — review */
-    const r = +d.reward, f = U.fee(r);
     return `<div class="step-head"><h2>Review & publish</h2><p>Check everything before your task goes live.</p></div>
       <div class="card" style="overflow:hidden">
         <div class="review-block"><div class="rb-head"><small>Task type</small><button class="edit-link" data-edit-step="1">Edit</button></div>
@@ -1106,10 +1215,7 @@
           <div class="meta" style="margin-top:10px;display:flex;gap:6px;align-items:center">${icon('clock', 'i-14')}${esc(timeText(d))}</div>
           ${d.notes ? `<p class="meta" style="margin:6px 0 0">${esc(d.notes)}</p>` : ''}</div>
         <div class="review-block"><div class="rb-head"><small>Payment</small><button class="edit-link" data-edit-step="4">Edit</button></div>
-          ${draftTotals(d).budget ? `<div class="kv"><span>Item budget (max)</span><b>${money(draftTotals(d).budget)}</b></div>` : ''}
-          <div class="kv"><span>Reward</span><b>${money(r)}</b></div>
-          <div class="kv"><span>Platform fee (10%)</span><b>${money(f)}</b></div>
-          <div class="kv total"><span>Total payable</span><b class="text-green">${money(draftTotals(d).tot)}</b></div></div>
+          ${payBreakdown(draftTotals(d))}</div>
       </div>
       <div style="margin-top:14px">${U.escrowNote(true)}</div>
       <p class="meta" style="text-align:center;margin:14px 8px 0;line-height:1.5">Choose how to pay on the next screen.</p>`;
@@ -1122,13 +1228,14 @@
     return [base, base + 60 + (d.type === 'buy' ? 30 : 0)];
   }
 
-  function feeBreakdown(d) {
-    const { reward, fee, budget, tot } = draftTotals(d);
-    return `${budget ? `<div class="kv"><span>Item budget (max)</span><b class="money">${money(budget)}</b></div>` : ''}
-      <div class="kv"><span>Reward for runner</span><b class="money">${money(reward)}</b></div>
-      <div class="kv"><span>Platform fee (10% of reward)</span><b class="money">${money(fee)}</b></div>
-      <div class="kv total"><span>Total payable</span><b class="money text-green">${money(tot)}</b></div>
-      ${budget ? '<div class="hint">Unused budget is refunded to your wallet after delivery.</div>' : ''}`;
+  function feeBreakdown(d) { return payBreakdown(draftTotals(d)); }
+
+  function payBreakdown(x, totalLabel = 'Total payable') {
+    return `${x.budget ? `<div class="kv"><span>Item price (max)</span><b class="money">${money(x.budget)}</b></div>` : ''}
+      <div class="kv"><span>Runner reward</span><b class="money">${money(x.reward)}</b></div>
+      <div class="kv"><span>Security deposit <span class="meta">(refundable)</span></span><b class="money">${money(x.deposit)}</b></div>
+      <div class="kv total"><span>${totalLabel}</span><b class="money">${money(x.tot)}</b></div>
+      <div class="hint" style="line-height:1.5">After delivery ${money(x.deposit - x.feeUser)} of the deposit comes back to you and ${money(x.feeUser)} is the platform fee.${x.budget ? ' Unused item budget is refunded too.' : ''}</div>`;
   }
 
   function timeText(d) {
@@ -1168,7 +1275,7 @@
         const b = String(d.budget ?? '').trim();
         if (!b) e.budget = 'Enter the most you want to spend on items';
         else if (!/^\d{1,6}$/.test(b)) e.budget = 'Enter a valid amount';
-        else if (+b < 50) e.budget = 'Minimum budget is ₹50';
+        else if (+b < 10) e.budget = 'Minimum budget is ₹10';
         else if (+b > 50000) e.budget = 'Maximum budget is ₹50,000';
       }
     }
@@ -1187,7 +1294,7 @@
     if (n === 4) {
       const r = +d.reward;
       if (!r) e.reward = 'Enter a reward amount';
-      else if (r < 30) e.reward = 'Minimum reward is ₹30';
+      else if (r < 5) e.reward = 'Minimum reward is ₹5';
       else if (r > 5000) e.reward = 'Maximum reward is ₹5,000';
     }
     return e;
@@ -1260,11 +1367,7 @@
             <div style="min-width:0;flex:1"><b class="truncate" style="display:block;font-size:14.5px">${esc(d.title)}</b><div class="meta truncate">${esc(route)}</div></div>
           </div>
           <div class="divider"></div>
-          ${budget ? `<div class="kv"><span>Item budget (max)</span><b>${money(budget)}</b></div>` : ''}
-          <div class="kv"><span>Reward</span><b>${money(reward)}</b></div>
-          <div class="kv"><span>Platform fee (10%)</span><b>${money(fee)}</b></div>
-          <div class="kv total"><span>Total</span><b>${money(tot)}</b></div>
-          ${budget ? '<div class="hint">Unused budget is refunded after delivery.</div>' : ''}
+          ${payBreakdown(draftTotals(d), 'Total')}
         </div>
 
         <div class="list-label">Pay with</div>
@@ -1357,7 +1460,8 @@
 
   function publishTask(d, payment) {
     const s = S();
-    const { reward, fee, budget, tot } = draftTotals(d);
+    const x = draftTotals(d);
+    const { reward, fee, budget, tot } = x;
     const help = d.type === 'help';
     const task = {
       id: uid('t'), type: d.type, title: d.title.trim(), description: d.description.trim(), category: d.category,
@@ -1365,14 +1469,13 @@
       reward, fee, budget: d.budget ? +d.budget : null, image: d.image, instructions: d.instructions.trim(), notes: d.notes.trim(),
       time: timeText(d), postedAt: Date.now(), requester: me(), status: 'open', runner: null, step: 0, postedByMe: true,
       payment, itemEscrow: budget, purchase: null,
+      fees: { fee: x.fee, feeUser: x.feeUser, feeRunner: x.feeRunner, deposit: x.deposit, stake: x.stake },
     };
     task.eta = etaFor(task);
     s.tasks.unshift(task);
     if (payment.method === 'wallet') s.wallet.available -= tot;
     s.wallet.spending += tot;
-    if (budget) addTxn({ kind: 'payment', title: 'Item budget', note: `${task.title} · held in escrow`, amount: -budget });
-    addTxn({ kind: 'payment', title: 'Task payment', note: `${task.title} · ${payment.label}`, amount: -reward });
-    addTxn({ kind: 'fee', title: 'Platform fee', note: task.title, amount: -fee });
+    addTxn({ kind: 'payment', title: 'Task payment', note: `${task.title} · ${payment.label} · held in escrow`, amount: -tot });
     notify({ icon: 'megaphone', title: 'Task published', text: `"${task.title}" is now visible to nearby runners.`, task: task.id });
     Object.keys(s_users()).forEach((uid2) => notifyUser(uid2, { icon: 'route', title: 'New task near you', text: `${task.title} · ${money(task.reward)} reward`, task: task.id }));
     s.draft = null;
@@ -1425,7 +1528,7 @@
     const mine = t.requester === me();
     const iRun = t.runner === me();
     const runner = t.runner ? U.person(t.runner) : null;
-    const f = t.fee ?? U.fee(t.reward);
+    const m = M(t);
     const single = U.isSamePlace(t);
 
     let footer = '';
@@ -1485,11 +1588,13 @@
         <div class="reward-card" style="margin-top:16px">
           <div class="lbl">${mine ? 'Reward offered' : 'You earn'}</div>
           <div class="big money">${money(t.reward)}</div>
-          <div class="row" style="margin-top:6px"><span>Platform fee (10%, paid by requester)</span><span>${money(f)}</span></div>
-          ${itemHeld(t) ? `<div class="row"><span>Item budget (escrow)</span><span>${money(itemHeld(t))}</span></div>` : ''}
-          <div class="row"><span>Requester pays</span><span style="font-weight:700;color:#fff">${money(total(t))}</span></div>
+          ${itemHeld(t) ? `<div class="row" style="margin-top:6px"><span>Item price (max)</span><span>${money(itemHeld(t))}</span></div>` : ''}
+          <div class="row" ${itemHeld(t) ? '' : 'style="margin-top:6px"'}><span>Sender security deposit</span><span>${money(m.deposit)}</span></div>
+          <div class="row"><span>Runner security stake</span><span>${money(m.stake)}</span></div>
+          <div class="row"><span>Platform fee</span><span>${money(m.fee)} (${money(m.feeUser)} + ${money(m.feeRunner)})</span></div>
           <div style="margin-top:12px;display:inline-flex;gap:6px;align-items:center;font-size:12px;font-weight:600;background:rgba(255,255,255,.1);padding:5px 10px;border-radius:999px">${icon('lock', 'i-14')}Held in escrow until confirmed</div>
         </div>
+        ${settlementCard(t)}
         <div style="margin-top:12px">${U.escrowNote(true)}</div>
 
         ${runner && mine ? `<div class="section-title"><h2>Your runner</h2></div>
@@ -1544,50 +1649,60 @@
     const t = getTask(id);
     if (!t) return;
     if (t.status !== 'open') { U.toast('Sorry, this task was already accepted by another runner', 'error'); refresh(); return; }
-    const req = U.person(t.requester);
+    const req = U.person(t.requester), m = M(t), first = req.name.split(' ')[0];
     const ok = await U.confirmDialog({
       title: 'Accept this task?',
-      message: `You'll earn ${money(t.reward)} once ${req.name.split(' ')[0]} confirms completion. Only accept if you can finish it within ${t.eta || 'the expected time'}.`,
-      confirmText: 'Accept Task', tone: 'green', ic: 'handshake',
+      message: `A refundable security stake of ${money(m.stake)} is held from your wallet. When ${first} confirms delivery you get ${money(t.reward)} reward${itemHeld(t) ? ' + the item cost' : ''} and ${money(m.stake - m.feeRunner)} of the stake back. If you cancel, the stake is forfeited.`,
+      confirmText: `Accept · Stake ${money(m.stake)}`, tone: 'green', ic: 'handshake',
     });
     if (!ok) return;
     Store.reload();
     const fresh = getTask(id);
     if (!fresh || fresh.status !== 'open') { U.toast('Sorry, this task was just accepted by someone else', 'error'); refresh(); return; }
-    Object.assign(fresh, { status: 'accepted', runner: me(), acceptedByMe: true, step: 0, acceptedAt: Date.now() });
-    S().wallet.pending += fresh.reward;
-    notify({ icon: 'clipboard-check', title: 'You accepted a task', text: `${fresh.title} for ${req.name}. Head to the pickup point.`, task: fresh.id });
-    notifyUser(fresh.requester, { icon: 'user-check', title: `${S().user.firstName} accepted your task`, text: `"${fresh.title}" · ${S().user.rating}★ verified runner`, task: fresh.id });
+    const s = S();
+    if (s.wallet.available < m.stake) {
+      U.toast(`Add ${money(m.stake - s.wallet.available)} to your wallet to cover the stake`, 'warn');
+      openMoneySheet('add', m.stake - s.wallet.available);
+      return;
+    }
+    Object.assign(fresh, { status: 'accepted', runner: me(), acceptedByMe: true, step: 0, acceptedAt: Date.now(), stakePaid: m.stake });
+    s.wallet.available -= m.stake;
+    s.wallet.pending += fresh.reward;
+    addTxn({ kind: 'stake', title: 'Security stake', note: `${fresh.title} · refundable, held in escrow`, amount: -m.stake });
+    notify({ icon: 'clipboard-check', title: 'You accepted a task', text: `${fresh.title} for ${req.name}. ${money(m.stake)} stake held in escrow.`, task: fresh.id });
+    notifyUser(fresh.requester, { icon: 'user-check', title: `${s.user.firstName} accepted your task`, text: `"${fresh.title}" · ${s.user.rating}★ verified runner`, task: fresh.id });
     Store.save();
     U.toast('Task accepted! Head to the pickup point.', 'success');
     Router.go('tracking', { id: fresh.id }, { replace: true });
   }
 
+  /* Sender cancels: before acceptance → full refund; after acceptance → sheet scenario 3. */
   async function cancelTask(id) {
+    Store.reload();
     const t = getTask(id);
-    if (!t) return;
-    const tot = total(t);
-    const ok = await U.confirmDialog({ title: 'Cancel this task?', message: `${money(tot)} will be refunded to your wallet immediately. This can't be undone.`, confirmText: 'Cancel Task', cancelText: 'Keep Task', tone: 'danger', ic: 'circle-x' });
+    if (!t || t.status === 'completed' || t.status === 'cancelled') { refresh(); return; }
+    if (t.purchase?.status === 'pending') { U.toast('Approve or decline the bill first', 'warn'); return; }
+    if (t.runner && (t.step ?? 0) >= 4) { U.toast('Already delivered. Confirm it or report a problem.', 'warn'); return; }
+    const outcome = t.runner ? 'user_cancelled' : 'cancelled_open';
+    const pv = computeSettlement(t, outcome);
+    const rFirst = t.runner ? firstName(t.runner) : '';
+    const ok = await U.confirmDialog({
+      title: 'Cancel this task?',
+      message: t.runner
+        ? `You get ${money(pv.user)} back (${pv.lines.user}). ${rFirst} receives ${money(pv.runner)} (${pv.lines.runner}). Platform fee ${money(pv.platform)}.`
+        : `${money(pv.user)} will be refunded to your wallet.`,
+      confirmText: 'Cancel Task', cancelText: 'Keep Task', tone: 'danger', ic: 'circle-x',
+    });
     if (!ok) return;
     Store.reload();
-    const s = S();
-    const cur = getTask(id);
-    if (!cur || cur.status === 'cancelled' || cur.status === 'completed') { refresh(); return; }
-    const t2 = cur;
-    const prevRunner = t2.runner;
-    t2.status = 'cancelled';
-    s.wallet.available += tot;
-    s.wallet.spending = Math.max(0, s.wallet.spending - tot);
-    addTxn({ kind: 'refund', title: 'Refund', note: `${t2.title} (cancelled)`, amount: tot });
-    notify({ icon: 'undo-2', title: 'Task cancelled', text: `${money(tot)} refunded to your wallet.`, task: t2.id });
-    if (prevRunner && prevRunner !== me()) {
-      const ru = Store.state.users[prevRunner];
-      if (ru) ru.wallet.pending = Math.max(0, ru.wallet.pending - t2.reward);
-      notifyUser(prevRunner, { icon: 'bell-off', title: 'Task cancelled by requester', text: `"${t2.title}" was cancelled by ${S().user.firstName}.`, task: t2.id });
-      notify({ icon: 'bell-off', title: `${firstName(prevRunner)} was notified`, text: 'Your runner has been informed about the cancellation.' });
-    }
+    const t2 = getTask(id);
+    if (!t2 || t2.status === 'completed' || t2.status === 'cancelled') { refresh(); return; }
+    const st = applySettlement(t2, outcome);
+    t2.status = 'cancelled'; t2.cancelledBy = 'sender';
+    notify({ icon: 'undo-2', title: 'Task cancelled', text: `${money(st.user)} refunded to your wallet.`, task: t2.id });
+    if (t2.runner) notifyUser(t2.runner, { icon: 'bell-off', title: 'Task cancelled by sender', text: `"${t2.title}" · ${money(st.runner)} added to your wallet (${st.lines.runner}).`, task: t2.id });
     Store.save();
-    U.toast(`Task cancelled. ${money(tot)} refunded to your wallet.`);
+    U.toast(`Task cancelled. ${money(st.user)} refunded to your wallet.`);
     refresh();
   }
 
@@ -1754,13 +1869,7 @@
           <div class="progress-mini" style="height:8px"><span style="width:${cancelled ? 0 : Math.max(6, pct)}%"></span></div>
           <div class="meta" style="margin-top:8px;display:flex;justify-content:space-between"><span>Step ${Math.min(step + 1, 6)} of 6</span><span>${iRun ? 'You earn' : 'Reward'} <b class="text-green">${money(t.reward)}</b></span></div>
         </div>
-        ${held ? `<div class="card card-pad" style="margin-top:12px">
-          <div class="kv"><span>Item budget (escrow)</span><b>${money(held)}</b></div>
-          ${bill ? `<div class="kv"><span>Bill amount</span><b>${money(bill.amount)}${bill.photo ? ` <button class="edit-link" data-action="view-bill">View bill</button>` : ''}</b></div>
-            ${billPending ? `<div class="kv"><span>Status</span><b style="color:var(--warn-dk)">Awaiting approval</b></div>`
-              : `<div class="kv"><span>${done ? 'Refunded to sender' : 'Refund to sender'}</span><b class="text-green">${money(Math.max(0, held - bill.amount))}</b></div>`}`
-          : `<div class="meta" style="padding-top:4px">${iRun ? 'Add the bill when you buy the items.' : 'The runner adds the bill after buying.'}</div>`}
-        </div>` : ''}
+        ${escrowCard(t, { iRun, done })}
 
         <div class="card card-pad" style="margin-top:12px;display:flex;gap:12px;align-items:center">
           ${U.avatar(other, 'lg')}
@@ -1797,7 +1906,7 @@
         <div style="margin-top:14px">${U.escrowNote(true)}</div>
         <div style="display:flex;justify-content:center;gap:6px;margin-top:14px;flex-wrap:wrap">
           <button class="btn btn-ghost btn-sm" data-action="dispute">${icon('flag', 'i-16')}Report a problem</button>
-          ${!done && !cancelled && step < 2 && !bill ? `<button class="btn btn-ghost btn-sm text-danger" data-action="cancel">${icon('circle-x', 'i-16')}${iRun ? 'Withdraw from task' : 'Cancel task'}</button>` : ''}
+          ${!done && !cancelled && step < 4 && !billPending ? `<button class="btn btn-ghost btn-sm text-danger" data-action="cancel">${icon('circle-x', 'i-16')}Cancel task</button>` : ''}
         </div>
       </div>`,
       mount(el) {
@@ -1898,41 +2007,21 @@
     }
 
     if (t.step === 4) {
-      const held4 = itemHeld(t), cost4 = held4 ? Math.min(held4, t.purchase?.amount ?? held4) : 0, back4 = held4 - cost4;
+      const pv = computeSettlement(t, 'completed');
       const ok = await U.confirmDialog(iRun
-        ? { title: 'Simulate confirmation?', message: `${other.name.split(' ')[0]} will confirm the task and ${money(t.reward + cost4)} will move to your available balance.`, confirmText: 'Confirm', tone: 'green', ic: 'badge-check' }
-        : { title: 'Confirm completion?', message: `Only confirm if you've received everything as expected. ${money(t.reward + cost4)} will be released to ${other.name.split(' ')[0]}${back4 ? ` and ${money(back4)} comes back to your wallet` : ''}.`, confirmText: 'Release Payment', tone: 'green', ic: 'shield-check' });
+        ? { title: 'Simulate confirmation?', message: `${other.name.split(' ')[0]} will confirm the task and ${money(pv.runner)} (${pv.lines.runner}) moves to your wallet.`, confirmText: 'Confirm', tone: 'green', ic: 'badge-check' }
+        : { title: 'Confirm delivery?', message: `${other.name.split(' ')[0]} receives ${money(pv.runner)} (${pv.lines.runner}). You get ${money(pv.user)} back. Platform fee ${money(pv.platform)}.`, confirmText: 'Confirm & Release', tone: 'green', ic: 'shield-check' });
       if (!ok) return;
       Store.reload();
       const ft = getTask(id);
       if (!ft || ft.status === 'completed') { refresh(); return; }
       ft.step = 5; ft.status = 'completed'; ft.completedAt = Date.now();
-      const held = itemHeld(ft), cost = held ? Math.min(held, ft.purchase?.amount ?? held) : 0, back = held - cost;
-      ft.settlement = { cost, refund: back };
-      /* Pay the runner: reward + bill amount (if the runner is a demo account in this browser). */
-      const ru = Store.state.users[ft.runner];
-      if (ru) {
-        ru.wallet.pending = Math.max(0, ru.wallet.pending - ft.reward);
-        ru.wallet.available += ft.reward + cost;
-        ru.wallet.earnings += ft.reward;
-        ru.user.completed = (ru.user.completed ?? 0) + 1;
-        ru.user.tasks = (ru.user.tasks ?? 0) + 1;
-        if (cost) addTxnFor(ft.runner, { kind: 'reimburse', title: 'Item cost reimbursed', note: ft.title, amount: cost });
-        addTxnFor(ft.runner, { kind: 'reward', title: 'Task reward', note: ft.title, amount: ft.reward });
-        const n = { icon: 'wallet', title: `${money(ft.reward + cost)} added to your wallet`, text: `${U.person(ft.requester).name} confirmed "${ft.title}".`, task: ft.id };
-        if (iRun) notify(n); else notifyUser(ft.runner, n);
-      }
-      /* Return unused item budget to the requester. */
-      const rq = Store.state.users[ft.requester];
-      if (rq && back > 0) {
-        rq.wallet.available += back;
-        rq.wallet.spending = Math.max(0, rq.wallet.spending - back);
-        addTxnFor(ft.requester, { kind: 'refund', title: 'Unused budget refunded', note: ft.title, amount: back });
-      }
-      const rn = { icon: 'badge-check', title: 'Payment released', text: `${money(ft.reward + cost)} released to ${U.person(ft.runner).name}${back > 0 ? ` · ${money(back)} refunded to you` : ''}.`, task: ft.id };
-      if (iRun) notifyUser(ft.requester, rn); else notify(rn);
+      const st = applySettlement(ft, 'completed');
+      const rn = { icon: 'wallet', title: `${money(st.runner)} added to your wallet`, text: `${U.person(ft.requester).name} confirmed "${ft.title}".`, task: ft.id };
+      const qn = { icon: 'badge-check', title: 'Payment released', text: `${money(st.runner)} to ${U.person(ft.runner).name} · ${money(st.user)} refunded to you.`, task: ft.id };
+      if (iRun) { notify(rn); notifyUser(ft.requester, qn); } else { notify(qn); notifyUser(ft.runner, rn); }
       Store.save(); refresh();
-      U.toast(iRun ? `${money(ft.reward + cost)} added to your wallet` : `Payment released${back > 0 ? ` · ${money(back)} refunded` : ''}`, 'success');
+      U.toast(iRun ? `${money(st.runner)} added to your wallet` : `Payment released · ${money(st.user)} refunded`, 'success');
       setTimeout(() => openRating(ft.id), 700);
       return;
     }
@@ -2037,22 +2126,28 @@
     U.toast('Bill declined', 'info');
   }
 
+  /* Runner cancels after accepting: sender gets a full refund, runner's stake is the platform fee. */
   async function withdrawTask(id) {
-    const ok = await U.confirmDialog({ title: 'Withdraw from task?', message: 'The task goes back to the marketplace for other runners. Frequent withdrawals can lower your reliability score.', confirmText: 'Withdraw', tone: 'danger', ic: 'log-out' });
-    if (!ok) return;
     Store.reload();
     const t = getTask(id);
-    if (!t || t.runner !== me()) { refresh(); return; }
-    Object.assign(t, { status: 'open', runner: null, acceptedByMe: false, step: 0, purchase: null });
-    S().wallet.pending = Math.max(0, S().wallet.pending - t.reward);
-    notifyUser(t.requester, { icon: 'user-x', title: `${S().user.firstName} withdrew from your task`, text: `"${t.title}" is open again for other runners.`, task: t.id });
+    if (!t || t.runner !== me() || t.status === 'completed' || t.status === 'cancelled') { refresh(); return; }
+    const pv = computeSettlement(t, 'runner_cancelled');
+    const ok = await U.confirmDialog({ title: 'Cancel this task?', message: `Your ${money(stakeOf(t))} security stake will be forfeited and ${firstName(t.requester)} gets a full refund of ${money(pv.user)}.`, confirmText: 'Cancel Task', cancelText: 'Keep Task', tone: 'danger', ic: 'circle-x' });
+    if (!ok) return;
+    Store.reload();
+    const ft = getTask(id);
+    if (!ft || ft.runner !== me() || ft.status === 'completed' || ft.status === 'cancelled') { refresh(); return; }
+    const st = applySettlement(ft, 'runner_cancelled');
+    ft.status = 'cancelled'; ft.cancelledBy = 'runner';
+    notify({ icon: 'circle-x', title: 'You cancelled a task', text: `${money(stakeOf(ft))} stake forfeited · "${ft.title}"`, task: ft.id });
+    notifyUser(ft.requester, { icon: 'user-x', title: `${S().user.firstName} cancelled your task`, text: `Full refund of ${money(st.user)} added to your wallet.`, task: ft.id });
     Store.save();
-    U.toast('You withdrew from the task', 'info');
-    Router.go('task', { id }, { replace: true, anim: 'fade' });
+    U.toast(`Task cancelled. ${money(stakeOf(ft))} stake forfeited.`, 'info');
+    refresh();
   }
 
   /* ---------------- Wallet ---------------- */
-  const TXN_ICON = { reimburse: ['receipt-text', 'green'], reward: ['arrow-down-left', 'green'], topup: ['plus', 'green'], refund: ['undo-2', 'green'], payment: ['arrow-up-right', ''], fee: ['percent', 'amber'], withdrawal: ['landmark', ''] };
+  const TXN_ICON = { stake: ['shield', 'amber'], stake_return: ['undo-2', 'green'], reimburse: ['receipt-text', 'green'], reward: ['arrow-down-left', 'green'], topup: ['plus', 'green'], refund: ['undo-2', 'green'], payment: ['arrow-up-right', ''], fee: ['percent', 'amber'], withdrawal: ['landmark', ''] };
   function txnRow(x) {
     const [ic, tone] = TXN_ICON[x.kind] || ['circle', ''];
     return `<div class="txn tappable" data-txn="${x.id}" role="button" tabindex="0">

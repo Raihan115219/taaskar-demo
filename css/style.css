@@ -821,3 +821,10 @@ input[type=range] { width: 100%; accent-color: var(--green); height: 28px; }
 /* The phone frame must never scroll itself (focus/scrollIntoView could shift it). */
 .app { overflow: clip; }
 .bottom-nav.nav-hidden { visibility: hidden; pointer-events: none; transition: transform .25s var(--ease), visibility 0s linear .25s; }
+
+/* ---------- Escrow & settlement ---------- */
+.card-title { display: flex; align-items: center; gap: 8px; font-size: 14.5px; font-weight: 700; margin-bottom: 6px; }
+.settle-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 8px 0; font-size: 14px; }
+.settle-row + .settle-row { border-top: 1px solid var(--line); }
+.settle-row small { display: block; font-size: 12px; color: var(--muted); margin-top: 2px; line-height: 1.4; }
+.settle-row b { white-space: nowrap; font-weight: 700; }

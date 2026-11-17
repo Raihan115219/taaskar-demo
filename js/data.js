@@ -283,8 +283,8 @@ window.TData = (() => {
 
   const FAQS = [
     { q: 'How does escrow payment work?', a: 'When you publish a task, the reward and platform fee are held by TAASKAR. The runner is paid only after you confirm the task is complete.' },
-    { q: 'What is the platform fee?', a: 'TAASKAR charges 10% of the reward to the requester. Runners keep 100% of the reward shown on the task.' },
-    { q: 'Can I cancel a task?', a: 'Open tasks can be cancelled at any time for a full refund. Once a runner has picked up the item, raise a dispute instead.' },
+    { q: 'What is the platform fee?', a: 'The fee is 10% of the reward (minimum ₹5). 80% comes from the sender’s security deposit and 20% from the runner’s security stake. The rest of the deposit and stake is refunded.' },
+    { q: 'Can I cancel a task?', a: 'Before a runner accepts, you get a full refund. After acceptance, the runner is paid for items already bought plus their stake, and the platform fee comes from your deposit. If the runner cancels, you get a full refund and their stake is forfeited.' },
     { q: 'How are runners verified?', a: 'Every runner verifies their phone number and government ID (Aadhaar or PAN). Verified users show a green badge.' },
   ];
 
